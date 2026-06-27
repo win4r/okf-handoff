@@ -1,0 +1,929 @@
+#!/usr/bin/env python3
+"""okf_handoff.py — create, validate, and verify OKF-style Claude Code session handoffs.
+
+A *handoff* is an Open Knowledge Format (OKF v0.1) bundle: a directory of markdown
+files with YAML frontmatter. It captures the state of a long Claude Code session
+so a *fresh* session can resume safely without relying on hidden chat history.
+
+This tool has zero third-party dependencies (Python 3.8+ stdlib only) and never
+contacts any network or paid service. It does three things:
+
+  create    Inspect REAL git state and scaffold a handoff bundle. Deterministic git
+            facts (branch, commit, changed files, fingerprint) are filled in; the
+            judgment sections are left as `<<FILL: ...>>` sentinels for the agent to
+            complete from the actual session. Test results are NEVER invented.
+
+  validate  Check OKF v0.1 conformance AND handoff quality (required concepts,
+            filled sentinels, an honest test-results record, a "Do Not Assume"
+            section, next actions, ...). Exit 0 = OK, 1 = problems found.
+
+  verify    Compare the git state recorded in the bundle against the live repo and
+            report drift. A handoff is GUIDANCE, NOT GROUND TRUTH — a resuming
+            session runs this first. Exit 0 = matches, 3 = drift, 2 = error.
+
+The "OKF-Handoff profile" of OKF v0.1 is documented in SPEC.md next to this repo.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# --------------------------------------------------------------------------- #
+# Profile constants                                                           #
+# --------------------------------------------------------------------------- #
+
+OKF_VERSION = "0.1"
+SENTINEL_RE = re.compile(r"<<FILL:[^>]*>>")
+RESERVED_FILENAMES = {"index.md", "log.md"}
+
+# Concept types this profile defines. Required ones make a handoff usable at all.
+REQUIRED_TYPES = ["Handoff Manifest", "Git State", "Progress", "Verification"]
+RECOMMENDED_TYPES = ["Decisions", "Open Questions"]
+
+VALID_STATUS = {"in_progress", "blocked", "ready_for_review", "done"}
+VALID_TESTS_STATUS = {"passed", "failed", "partial", "not_run"}
+# Maps the body "**Status: X**" line to the frontmatter tests_status value.
+BODY_STATUS_MAP = {
+    "PASSED": "passed",
+    "FAILED": "failed",
+    "PARTIAL": "partial",
+    "NOT RUN": "not_run",
+}
+
+
+# --------------------------------------------------------------------------- #
+# Small utilities                                                             #
+# --------------------------------------------------------------------------- #
+
+def now_iso() -> str:
+    """Current UTC time as an ISO-8601 'Z' string (second precision)."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def slugify(text: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", text.strip().lower()).strip("-")
+    return s or "handoff"
+
+
+ISO_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$"
+)
+
+
+def is_iso8601(value: str) -> bool:
+    return bool(ISO_RE.match(value.strip()))
+
+
+# --------------------------------------------------------------------------- #
+# Frontmatter parsing                                                         #
+# --------------------------------------------------------------------------- #
+# A deliberately small, dependency-free YAML-subset parser. We control the bundle
+# format, so we only need: `key: scalar`, `key: [a, b]`, quoted scalars, comments,
+# and block lists (`key:` then `  - item` lines). Keeping the parser self-contained
+# means the validator behaves IDENTICALLY on every machine (no PyYAML drift).
+
+def _strip_quotes(v: str) -> str:
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        return v[1:-1]
+    return v
+
+
+def _parse_scalar(v: str):
+    v = v.strip()
+    if v.startswith("[") and v.endswith("]"):
+        inner = v[1:-1].strip()
+        if not inner:
+            return []
+        return [_strip_quotes(x) for x in inner.split(",") if x.strip() != ""]
+    return _strip_quotes(v)
+
+
+def parse_frontmatter(text: str):
+    """Return (frontmatter_dict, body_str, had_frontmatter_bool).
+
+    Only a leading `---` ... `---` block is treated as frontmatter.
+    """
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, text, False
+
+    # find the closing fence
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        # unterminated frontmatter — treat as no frontmatter
+        return {}, text, False
+
+    fm_lines = lines[1:end]
+    body = "\n".join(lines[end + 1:])
+
+    data = {}
+    i = 0
+    while i < len(fm_lines):
+        raw = fm_lines[i]
+        line = raw.rstrip()
+        stripped = line.strip()
+        i += 1
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = re.match(r"^([A-Za-z0-9_\-]+)\s*:\s*(.*)$", line)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2)
+        # strip trailing inline comments for unquoted scalars
+        if val and not (val.strip().startswith(("\"", "'", "["))):
+            val = re.sub(r"\s+#.*$", "", val)
+        if val.strip() == "":
+            # possible block list following
+            items = []
+            while i < len(fm_lines):
+                nxt = fm_lines[i]
+                mm = re.match(r"^\s+-\s+(.*)$", nxt)
+                if mm:
+                    items.append(_strip_quotes(re.sub(r"\s+#.*$", "", mm.group(1)).strip()))
+                    i += 1
+                elif nxt.strip() == "" or nxt.startswith("#"):
+                    i += 1
+                else:
+                    break
+            data[key] = items if items else ""
+        else:
+            data[key] = _parse_scalar(val)
+    return data, body, True
+
+
+# --------------------------------------------------------------------------- #
+# Markdown section helpers                                                    #
+# --------------------------------------------------------------------------- #
+
+def get_section(body: str, heading: str):
+    """Return the text of a markdown section by heading name (case-insensitive),
+    from the heading line until the next heading of the same or higher level, or None.
+    """
+    lines = body.splitlines()
+    target = heading.strip().lower()
+    start = None
+    start_level = 0
+    for idx, line in enumerate(lines):
+        m = re.match(r"^(#{1,6})\s+(.*?)\s*$", line)
+        if m and m.group(2).strip().lower() == target:
+            start = idx
+            start_level = len(m.group(1))
+            break
+    if start is None:
+        return None
+    out = []
+    for line in lines[start + 1:]:
+        m = re.match(r"^(#{1,6})\s+", line)
+        if m and len(m.group(1)) <= start_level:
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
+def section_has_list_item(section_text: str) -> bool:
+    """True if the section contains at least one real list item (bullet or numbered)
+    whose content is not blank and not a leftover sentinel."""
+    if section_text is None:
+        return False
+    for line in section_text.splitlines():
+        m = re.match(r"^\s*(?:[-*]|\d+[.)])\s+(\S.*)$", line)
+        if m and not SENTINEL_RE.search(m.group(1)):
+            return True
+    return False
+
+
+def section_has_content(section_text: str) -> bool:
+    """True if the section has any non-blank, non-comment line (excluding sentinels)."""
+    if section_text is None:
+        return False
+    for line in section_text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("<!--"):
+            continue
+        if SENTINEL_RE.search(s):
+            continue
+        return True
+    return False
+
+
+# --------------------------------------------------------------------------- #
+# Git inspection                                                              #
+# --------------------------------------------------------------------------- #
+
+class GitError(RuntimeError):
+    pass
+
+
+def git(repo: Path, *args: str) -> str:
+    try:
+        out = subprocess.run(
+            ["git", *args],
+            cwd=str(repo),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as e:  # git not installed
+        raise GitError("git executable not found") from e
+    except subprocess.CalledProcessError as e:
+        raise GitError(f"git {' '.join(args)} failed: {e.stderr.strip()}") from e
+    return out.stdout
+
+
+def is_git_repo(repo: Path) -> bool:
+    try:
+        return git(repo, "rev-parse", "--is-inside-work-tree").strip() == "true"
+    except GitError:
+        return False
+
+
+def capture_git_state(repo: Path) -> dict:
+    """Capture the REAL git state. No invention, no guessing."""
+    branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    commit = git(repo, "rev-parse", "HEAD").strip()
+    try:
+        subject = git(repo, "log", "-1", "--pretty=%s").strip()
+    except GitError:
+        subject = ""
+    porcelain = git(repo, "status", "--porcelain=v1").rstrip("\n")
+    diffstat = git(repo, "diff", "--stat", "HEAD").rstrip("\n")
+    fingerprint = compute_fingerprint(repo, commit)
+    return {
+        "branch": branch,
+        "commit": commit,
+        "subject": subject,
+        "porcelain": porcelain,
+        "diffstat": diffstat,
+        "fingerprint": fingerprint,
+    }
+
+
+def _hash_file(path: Path) -> str:
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+    except (OSError, IsADirectoryError):
+        return "UNREADABLE"
+    return h.hexdigest()
+
+
+def compute_fingerprint(repo: Path, commit: str) -> str:
+    """Deterministic, content-sensitive anchor for drift detection.
+
+    sha256 over HEAD + the *content* of every change vs HEAD: tracked changes (from
+    `git diff --name-status HEAD`, hashing each working-tree file) and untracked files
+    (from `git ls-files --others`, hashing each). Uses name-status + content hashes
+    rather than raw diff text, so the result is independent of diff/color/context git
+    config — the same repo state yields the same fingerprint on any machine.
+    """
+    tracked = []
+    for line in git(repo, "diff", "--name-status", "HEAD").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        status = parts[0]
+        if status[:1] in ("R", "C") and len(parts) >= 3:
+            old, new = parts[1], parts[2]
+            label, path_for_hash = f"{status}\t{old}\t{new}", new
+        else:
+            path_for_hash = parts[-1]
+            label = f"{status}\t{path_for_hash}"
+        content = "DELETED" if status[:1] == "D" else _hash_file(repo / path_for_hash)
+        tracked.append(f"{label}\t{content}")
+
+    untracked = []
+    for path in git(repo, "ls-files", "--others", "--exclude-standard").splitlines():
+        if path.strip():
+            untracked.append(f"{_hash_file(repo / path)}\t{path}")
+
+    payload = "\n".join(
+        [commit, "TRACKED", *sorted(tracked), "UNTRACKED", *sorted(untracked)]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def porcelain_table(porcelain: str) -> str:
+    if not porcelain.strip():
+        return "_Working tree clean — no changed files._"
+    rows = ["| Status | Path |", "|--------|------|"]
+    for line in porcelain.splitlines():
+        if not line.strip():
+            continue
+        code = line[:2].strip() or "?"
+        path = line[3:].strip()
+        rows.append(f"| `{code}` | {path} |")
+    return "\n".join(rows)
+
+
+# --------------------------------------------------------------------------- #
+# create                                                                      #
+# --------------------------------------------------------------------------- #
+
+def cmd_create(args) -> int:
+    repo = Path(args.repo).resolve()
+    if not is_git_repo(repo):
+        print(f"error: {repo} is not a git repository", file=sys.stderr)
+        return 2
+
+    state = capture_git_state(repo)
+    ts = now_iso()
+    date = ts[:10]
+    title = args.title or "Untitled session handoff"
+    handoff_id = args.id or f"{date}-{slugify(title)}"
+
+    if args.out:
+        bundle = Path(args.out).resolve()
+    else:
+        bundle = (repo / "handoffs" / handoff_id).resolve()
+
+    if bundle.exists() and any(bundle.iterdir()):
+        print(f"error: bundle dir already exists and is not empty: {bundle}", file=sys.stderr)
+        print("       choose another --id/--out or remove it first.", file=sys.stderr)
+        return 2
+    bundle.mkdir(parents=True, exist_ok=True)
+
+    files = _scaffold(handoff_id, title, ts, date, state)
+    for name, content in files.items():
+        (bundle / name).write_text(content, encoding="utf-8")
+
+    def under_repo(p: Path) -> str:
+        try:
+            return p.relative_to(repo).as_posix()
+        except ValueError:
+            return str(p)
+
+    bundle_disp = under_repo(bundle)
+    print(f"Created OKF handoff bundle: {bundle}")
+    print(f"  branch  {state['branch']}")
+    print(f"  commit  {state['commit'][:12]}")
+    n_changed = len([l for l in state['porcelain'].splitlines() if l.strip()])
+    print(f"  changed {n_changed} file(s) in working tree")
+    print()
+    print("Next:")
+    print("  1. Fill every <<FILL: ...>> sentinel from the REAL session (never invent test results).")
+    print(f"  2. Validate:  python scripts/okf_handoff.py validate {bundle_disp}")
+    print(f"  3. Verify:    python scripts/okf_handoff.py verify {bundle_disp}")
+    print("  4. Commit the bundle so the next session can read it from git.")
+    return 0
+
+
+def _scaffold(handoff_id, title, ts, date, state) -> dict:
+    branch = state["branch"]
+    commit = state["commit"]
+    short = commit[:12]
+    subject = state["subject"]
+    diffstat = state["diffstat"] if state["diffstat"].strip() else "_No tracked changes vs HEAD._"
+
+    index_md = f"""---
+okf_version: "{OKF_VERSION}"
+---
+
+# Session Handoff: {title}
+
+Captured {ts} from branch `{branch}` at commit `{short}`.
+
+This is an **OKF v0.1** knowledge bundle. It is *guidance, not ground truth*:
+a resuming session MUST re-verify git state and tests before trusting it.
+
+# Concepts
+
+* [Handoff Manifest](manifest.md) - start here: task, status, and how to resume
+* [Git State](git-state.md) - real branch/commit/changed files captured at handoff time
+* [Progress](progress.md) - completed work and the next concrete actions
+* [Decisions](decisions.md) - choices made and why
+* [Verification](verification.md) - commands run, real test results, known failures, Do Not Assume
+* [Open Questions](open-questions.md) - unresolved questions
+
+# History
+
+* [log.md](log.md) - chronological history of this handoff
+"""
+
+    manifest_md = f"""---
+type: Handoff Manifest
+title: {title}
+description: <<FILL: one sentence describing the task this handoff resumes>>
+status: in_progress
+timestamp: {ts}
+handoff_id: {handoff_id}
+branch: {branch}
+commit: {commit}
+tags: [handoff, claude-code]
+---
+
+# Task
+
+<<FILL: what are we trying to accomplish? the original goal, in a few sentences>>
+
+# Status
+
+<<FILL: one paragraph — where things stand right now>>
+
+# How to resume (read this first)
+
+A fresh session should, in order:
+
+1. Read this manifest and [Verification](verification.md).
+2. Detect git drift:
+   `python scripts/okf_handoff.py verify <this-bundle>`
+3. Re-run the tests yourself before trusting the recorded results.
+4. Reconcile any discrepancies, then follow [Next Actions](progress.md).
+
+Related: [Git State](git-state.md) · [Progress](progress.md) ·
+[Decisions](decisions.md) · [Open Questions](open-questions.md)
+"""
+
+    git_state_md = f"""---
+type: Git State
+title: Git State at Handoff
+description: Real git facts captured when this handoff was created. A snapshot, not current truth.
+timestamp: {ts}
+branch: {branch}
+commit: {commit}
+status_fingerprint: {state['fingerprint']}
+tags: [handoff, git, verification]
+---
+
+# Branch & Commit
+
+* Branch: `{branch}`
+* HEAD: `{commit}`
+* Subject: {subject or '_(no commit subject)_'}
+
+# Changed Files
+
+Captured from `git status --porcelain=v1` at {ts}:
+
+{porcelain_table(state['porcelain'])}
+
+# Diffstat
+
+From `git diff --stat HEAD`:
+
+```
+{diffstat}
+```
+
+# How to verify
+
+This snapshot was true at {ts}. The repo may have moved on. Detect drift with:
+
+```
+python scripts/okf_handoff.py verify <this-bundle>
+```
+
+Do **not** assume these files are still in this state. See [Verification](verification.md).
+"""
+
+    progress_md = f"""---
+type: Progress
+title: Progress and Next Actions
+description: What is done and what to do next.
+timestamp: {ts}
+tags: [handoff]
+---
+
+# Completed
+
+<<FILL: bullet list of work actually finished this session>>
+
+# In Progress
+
+<<FILL: what is partially done, and exactly where you stopped>>
+
+# Next Actions
+
+1. <<FILL: the first concrete next step a resuming session should take>>
+"""
+
+    decisions_md = f"""---
+type: Decisions
+title: Decisions and Rationale
+description: Choices made this session and why, so they are not relitigated.
+timestamp: {ts}
+tags: [handoff]
+---
+
+# Decisions
+
+## <<FILL: short decision title>>
+
+* **Choice**: <<FILL: what was decided>>
+* **Why**: <<FILL: rationale>>
+* **Alternatives considered**: <<FILL: what was rejected, and why>>
+"""
+
+    verification_md = f"""---
+type: Verification
+title: Verification Record
+description: Commands run, real test results, known failures, and Do Not Assume notes.
+timestamp: {ts}
+tests_status: not_run
+tags: [handoff, verification]
+---
+
+# Commands Run
+
+Commands actually executed this session, with their purpose:
+
+```
+<<FILL: $ command            # what it was for>>
+```
+
+# Test Results
+
+> Test results MUST come from real runs. If you did not run them, say so.
+> Set `tests_status` in the frontmatter to one of: passed | failed | partial | not_run,
+> and make the Status line below match.
+
+**Status: NOT RUN**
+
+<<FILL: which tests to run to verify this work, e.g. `pytest -q`. OR, if you ran
+them, replace the Status line above with PASSED/FAILED/PARTIAL and paste the exact
+command and its result counts here.>>
+
+# Known Failures
+
+<<FILL: anything currently broken or expected to fail, or "None known">>
+
+# Do Not Assume
+
+* <<FILL: something a resuming session must NOT take on faith — say how to verify it>>
+"""
+
+    open_questions_md = f"""---
+type: Open Questions
+title: Open Questions
+description: Unresolved questions blocking or shaping the next steps.
+timestamp: {ts}
+tags: [handoff]
+---
+
+# Open Questions
+
+1. <<FILL: an unresolved question, with context and who/what could answer it. Use "None" if there are none>>
+"""
+
+    log_md = f"""# Handoff Log
+
+## {date}
+* **Creation**: Created handoff for "{title}" from branch `{branch}` at `{short}`.
+"""
+
+    return {
+        "index.md": index_md,
+        "manifest.md": manifest_md,
+        "git-state.md": git_state_md,
+        "progress.md": progress_md,
+        "decisions.md": decisions_md,
+        "verification.md": verification_md,
+        "open-questions.md": open_questions_md,
+        "log.md": log_md,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# validate                                                                    #
+# --------------------------------------------------------------------------- #
+
+class Findings:
+    def __init__(self):
+        self.errors = []
+        self.warnings = []
+
+    def error(self, where, msg):
+        self.errors.append((where, msg))
+
+    def warn(self, where, msg):
+        self.warnings.append((where, msg))
+
+
+def _read(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def validate_bundle(bundle: Path) -> Findings:
+    f = Findings()
+    if not bundle.is_dir():
+        f.error(str(bundle), "bundle path is not a directory")
+        return f
+
+    md_files = sorted(bundle.rglob("*.md"))
+    if not md_files:
+        f.error(str(bundle), "bundle contains no .md files")
+        return f
+
+    concepts_by_type = {}
+    all_paths = {p.relative_to(bundle).as_posix() for p in md_files}
+
+    for path in md_files:
+        rel = path.relative_to(bundle).as_posix()
+        name = path.name
+        text = _read(path)
+        fm, body, had_fm = parse_frontmatter(text)
+        is_root = path.parent == bundle
+
+        # --- sentinel check (handoff quality): nothing left unfilled --------
+        for i, line in enumerate(text.splitlines(), 1):
+            if SENTINEL_RE.search(line):
+                f.error(rel, f"unfilled <<FILL>> sentinel at line {i}")
+
+        # --- OKF conformance ----------------------------------------------
+        if name == "index.md":
+            if had_fm:
+                if not is_root:
+                    f.error(rel, "non-root index.md must not contain frontmatter (OKF §6)")
+                else:
+                    extra = [k for k in fm if k != "okf_version"]
+                    if extra:
+                        f.warn(rel, f"root index.md frontmatter should only carry okf_version (saw: {', '.join(extra)})")
+                    if fm.get("okf_version") not in (OKF_VERSION, None):
+                        f.warn(rel, f"okf_version is '{fm.get('okf_version')}', expected '{OKF_VERSION}'")
+            continue
+        if name == "log.md":
+            if had_fm:
+                f.warn(rel, "log.md should not contain frontmatter (OKF §7)")
+            if not re.search(r"(?m)^##\s+\d{4}-\d{2}-\d{2}\s*$", body or text):
+                f.warn(rel, "log.md has no `## YYYY-MM-DD` date heading (OKF §7)")
+            continue
+
+        # concept document
+        if not had_fm:
+            f.error(rel, "concept document has no parseable YAML frontmatter (OKF §9.1)")
+            continue
+        ctype = fm.get("type")
+        if not (isinstance(ctype, str) and ctype.strip()):
+            f.error(rel, "frontmatter `type` is missing or empty (OKF §9.2)")
+            continue
+        concepts_by_type.setdefault(ctype.strip(), []).append((rel, fm, body))
+
+    # --- cross-link integrity (OKF §9: broken links are WARN, never fatal) --
+    _check_links(bundle, md_files, all_paths, f)
+
+    # --- handoff profile: required & recommended concept types --------------
+    for t in REQUIRED_TYPES:
+        if t not in concepts_by_type:
+            f.error(str(bundle), f"missing required concept type: '{t}'")
+    for t in RECOMMENDED_TYPES:
+        if t not in concepts_by_type:
+            f.warn(str(bundle), f"missing recommended concept type: '{t}'")
+
+    # --- per-concept content checks ----------------------------------------
+    _check_manifest(concepts_by_type.get("Handoff Manifest", []), f)
+    _check_git_state(concepts_by_type.get("Git State", []), f)
+    _check_progress(concepts_by_type.get("Progress", []), f)
+    _check_verification(concepts_by_type.get("Verification", []), f)
+    return f
+
+
+def _check_links(bundle, md_files, all_paths, f: Findings):
+    link_re = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+    for path in md_files:
+        rel = path.relative_to(bundle).as_posix()
+        text = _read(path)
+        for m in link_re.finditer(text):
+            target = m.group(1).strip()
+            if not target or target.startswith("#"):
+                continue
+            low = target.lower()
+            if low.startswith(("http://", "https://", "mailto:", "tel:", "ftp://")):
+                continue
+            # strip anchors/queries
+            target = target.split("#", 1)[0].split("?", 1)[0]
+            if not target:
+                continue
+            if target.startswith("/"):
+                resolved = target.lstrip("/")
+            else:
+                resolved = (path.parent / target).resolve()
+                try:
+                    resolved = resolved.relative_to(bundle).as_posix()
+                except ValueError:
+                    # points outside the bundle — not our concern
+                    continue
+            # only check links that look like they target bundle files
+            if resolved.endswith("/"):
+                resolved = resolved + "index.md"
+            if resolved.endswith(".md") and resolved not in all_paths:
+                f.warn(rel, f"broken bundle link -> {m.group(1)} (OKF tolerates this; fix if unintended)")
+
+
+def _check_manifest(items, f: Findings):
+    for rel, fm, body in items:
+        status = fm.get("status")
+        if not status:
+            f.error(rel, "manifest missing `status`")
+        elif status not in VALID_STATUS:
+            f.error(rel, f"manifest `status` '{status}' not in {sorted(VALID_STATUS)}")
+        if not fm.get("branch"):
+            f.error(rel, "manifest missing `branch`")
+        commit = str(fm.get("commit", ""))
+        if not re.match(r"^[0-9a-f]{7,40}$", commit):
+            f.error(rel, "manifest `commit` missing or not a git SHA")
+        ts = str(fm.get("timestamp", ""))
+        if not ts:
+            f.warn(rel, "manifest missing `timestamp`")
+        elif not is_iso8601(ts):
+            f.warn(rel, f"manifest `timestamp` '{ts}' is not ISO-8601")
+        if not fm.get("handoff_id"):
+            f.warn(rel, "manifest missing `handoff_id`")
+        if not section_has_content(get_section(body, "Task")):
+            f.error(rel, "manifest '# Task' section is empty")
+
+
+def _check_git_state(items, f: Findings):
+    for rel, fm, body in items:
+        if not fm.get("status_fingerprint"):
+            f.error(rel, "Git State missing `status_fingerprint` (needed by `verify`)")
+        if not fm.get("branch"):
+            f.error(rel, "Git State missing `branch`")
+        if not str(fm.get("commit", "")):
+            f.error(rel, "Git State missing `commit`")
+
+
+def _check_progress(items, f: Findings):
+    for rel, fm, body in items:
+        if not section_has_list_item(get_section(body, "Next Actions")):
+            f.error(rel, "Progress '# Next Actions' has no concrete action items")
+
+
+def _check_verification(items, f: Findings):
+    for rel, fm, body in items:
+        ts = fm.get("tests_status")
+        if ts not in VALID_TESTS_STATUS:
+            f.error(rel, f"Verification `tests_status` must be one of {sorted(VALID_TESTS_STATUS)} (got {ts!r})")
+            ts = None
+
+        results = get_section(body, "Test Results")
+        if results is None:
+            f.error(rel, "Verification missing '# Test Results' section")
+        else:
+            m = re.search(r"(?mi)^\s*\**\s*Status:\s*\**\s*(PASSED|FAILED|PARTIAL|NOT RUN)\b", results)
+            if not m:
+                f.error(rel, "Test Results must declare `**Status: PASSED|FAILED|PARTIAL|NOT RUN**`")
+            else:
+                body_status = m.group(1).upper()
+                mapped = BODY_STATUS_MAP[body_status]
+                if ts is not None and mapped != ts:
+                    f.error(
+                        rel,
+                        f"Test Results Status '{body_status}' contradicts frontmatter "
+                        f"tests_status '{ts}' — never invent test results",
+                    )
+                if body_status != "NOT RUN":
+                    # a claimed result must show evidence (a command and/or counts)
+                    has_cmd = "```" in results or re.search(r"(?m)^\s*\$\s+\S", results)
+                    has_counts = re.search(r"\d+\s+(passed|failed|error|ok|skipped)", results, re.I)
+                    if not (has_cmd or has_counts):
+                        f.error(
+                            rel,
+                            f"Test Results claims '{body_status}' but shows no command or "
+                            "result counts as evidence — never invent test results",
+                        )
+
+        if not section_has_list_item(get_section(body, "Do Not Assume")):
+            f.error(rel, "Verification '# Do Not Assume' section has no items")
+        if get_section(body, "Commands Run") is None:
+            f.warn(rel, "Verification missing '# Commands Run' section")
+
+
+def cmd_validate(args) -> int:
+    bundle = Path(args.bundle).resolve()
+    f = validate_bundle(bundle)
+    rel = lambda p: p  # findings already store relative paths
+    if args.json:
+        import json
+        print(json.dumps({
+            "bundle": str(bundle),
+            "ok": not f.errors,
+            "errors": [{"where": w, "message": m} for w, m in f.errors],
+            "warnings": [{"where": w, "message": m} for w, m in f.warnings],
+        }, indent=2))
+        return 0 if not f.errors else 1
+
+    for where, msg in f.warnings:
+        print(f"WARN  {where}: {msg}")
+    for where, msg in f.errors:
+        print(f"ERROR {where}: {msg}")
+    print()
+    if f.errors:
+        print(f"INVALID — {len(f.errors)} error(s), {len(f.warnings)} warning(s): {bundle}")
+        return 1
+    print(f"VALID — OKF-conformant handoff, {len(f.warnings)} warning(s): {bundle}")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# verify (drift detection)                                                    #
+# --------------------------------------------------------------------------- #
+
+def cmd_verify(args) -> int:
+    bundle = Path(args.bundle).resolve()
+    gs_path = bundle / "git-state.md"
+    if not gs_path.exists():
+        print(f"error: no git-state.md in bundle: {bundle}", file=sys.stderr)
+        return 2
+    fm, _body, _ = parse_frontmatter(_read(gs_path))
+    rec_commit = str(fm.get("commit", "")).strip()
+    rec_branch = str(fm.get("branch", "")).strip()
+    rec_fp = str(fm.get("status_fingerprint", "")).strip()
+    if not rec_fp:
+        print("error: git-state.md has no status_fingerprint to compare against", file=sys.stderr)
+        return 2
+
+    repo = Path(args.repo).resolve()
+    if not is_git_repo(repo):
+        print(f"error: {repo} is not a git repository", file=sys.stderr)
+        return 2
+
+    live = capture_git_state(repo)
+    drift = []
+    if rec_branch and live["branch"] != rec_branch:
+        drift.append(f"branch: handoff='{rec_branch}' now='{live['branch']}'")
+    if rec_commit and live["commit"] != rec_commit:
+        drift.append(f"HEAD: handoff={rec_commit[:12]} now={live['commit'][:12]}")
+    if live["fingerprint"] != rec_fp:
+        drift.append("working tree changed since handoff (status fingerprint differs)")
+
+    if args.json:
+        import json
+        print(json.dumps({
+            "bundle": str(bundle),
+            "repo": str(repo),
+            "drift": bool(drift),
+            "details": drift,
+            "recorded": {"branch": rec_branch, "commit": rec_commit, "fingerprint": rec_fp},
+            "live": {"branch": live["branch"], "commit": live["commit"], "fingerprint": live["fingerprint"]},
+        }, indent=2))
+        return 3 if drift else 0
+
+    print(f"Handoff : branch {rec_branch or '?'} @ {rec_commit[:12] or '?'}")
+    print(f"Live    : branch {live['branch']} @ {live['commit'][:12]}")
+    print()
+    if not drift:
+        print("NO DRIFT — repo matches the handoff snapshot. Still re-run tests before trusting them.")
+        return 0
+    print("DRIFT DETECTED — the repo has moved since this handoff was written:")
+    for d in drift:
+        print(f"  - {d}")
+    print()
+    print("The handoff is GUIDANCE, NOT GROUND TRUTH. Re-read changed files, re-run")
+    print("tests, and reconcile before continuing. (drift is expected, not an error)")
+    return 3
+
+
+# --------------------------------------------------------------------------- #
+# main                                                                        #
+# --------------------------------------------------------------------------- #
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="okf_handoff.py",
+        description="Create, validate, and verify OKF-style Claude Code session handoffs.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("create", help="capture real git state and scaffold a handoff bundle")
+    c.add_argument("--repo", default=".", help="git repo to inspect (default: cwd)")
+    c.add_argument("--out", default=None, help="bundle output dir (default: <repo>/handoffs/<id>)")
+    c.add_argument("--title", default=None, help="short task title")
+    c.add_argument("--id", default=None, help="handoff id (default: <date>-<slug(title)>)")
+    c.set_defaults(func=cmd_create)
+
+    v = sub.add_parser("validate", help="check OKF conformance and handoff quality")
+    v.add_argument("bundle", help="path to the handoff bundle directory")
+    v.add_argument("--json", action="store_true", help="emit JSON")
+    v.set_defaults(func=cmd_validate)
+
+    vf = sub.add_parser("verify", help="detect git drift vs the recorded snapshot")
+    vf.add_argument("bundle", help="path to the handoff bundle directory")
+    vf.add_argument("--repo", default=".", help="git repo to compare against (default: cwd)")
+    vf.add_argument("--json", action="store_true", help="emit JSON")
+    vf.set_defaults(func=cmd_verify)
+    return p
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except GitError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
