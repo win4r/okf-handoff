@@ -51,12 +51,32 @@ OKF permits producer-defined keys (OKF §4.1). This profile adds:
 
 ## 3. Drift fingerprint (the verification anchor)
 
-`git-state.md` records `status_fingerprint` =
-`sha256( HEAD_sha + "\n" + sorted(porcelain status lines) )`.
+`git-state.md` records a `status_fingerprint` that is **content-sensitive**, so editing
+an already-modified file still registers as drift. It is the sha256 of:
 
-It is fully deterministic: the same repo state produces the same fingerprint on any
-machine. `verify` recomputes it against the live repo to detect drift. A handoff is a
-**snapshot**, and the repo will move on — drift is expected, not a failure.
+```
+HEAD_sha
+TRACKED
+<sorted "status\tpath\tsha256(working-tree content)" for each change vs HEAD>
+UNTRACKED
+<sorted "sha256(content)\tpath" for each untracked file>
+```
+
+Changes vs HEAD come from `git -c diff.renames=false diff --name-status HEAD` (rename
+detection is disabled so a rename hashes identically everywhere), and untracked files
+from `git ls-files --others --exclude-standard`. The handoff bundle's **own** files are
+excluded, so creating or committing the handoff is not itself reported as drift.
+
+`verify` recomputes this against the live repo. A handoff is a **snapshot**; the repo
+will move on — drift is expected, not a failure.
+
+**Reproducibility.** The fingerprint does not depend on git diff/color/context/rename
+config. It *can* differ across environments whose ignore rules (`core.excludesFile`) or
+end-of-line normalization differ; that only ever **over**-reports drift (the safe
+direction — a resuming session re-verifies anyway). Two known blind spots: a file-mode
+(`chmod`) change to an already-modified file, and index-only staging churn, are not
+reflected in the fingerprint (the working-tree bytes are unchanged). Re-running tests
+and reading `git status` on resume covers these.
 
 ## 4. Verification-first contract (the point of the profile)
 

@@ -39,7 +39,8 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 
 OKF_VERSION = "0.1"
-SENTINEL_RE = re.compile(r"<<FILL:[^>]*>>")
+SENTINEL_RE = re.compile(r"<<FILL:[^>]*>>")          # single-line, for per-item checks
+SENTINEL_SCAN = re.compile(r"<<FILL:.*?>>", re.S)    # whole-file, catches multi-line
 RESERVED_FILENAMES = {"index.md", "log.md"}
 
 # Concept types this profile defines. Required ones make a handoff usable at all.
@@ -78,6 +79,14 @@ ISO_RE = re.compile(
 
 def is_iso8601(value: str) -> bool:
     return bool(ISO_RE.match(value.strip()))
+
+
+def _rel_to(path: Path, base: Path):
+    """Posix path of `path` relative to `base`, or None if `path` is outside `base`."""
+    try:
+        return path.relative_to(base).as_posix()
+    except ValueError:
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -140,9 +149,11 @@ def parse_frontmatter(text: str):
         if not m:
             continue
         key, val = m.group(1), m.group(2)
-        # strip trailing inline comments for unquoted scalars
+        # strip trailing inline comments for unquoted scalars. Only treat ` # ` (hash
+        # followed by whitespace/end) as a comment, so values like "Fix bug #123" or a
+        # tag "#release" survive. Values needing a bare "#x" comment should be quoted.
         if val and not (val.strip().startswith(("\"", "'", "["))):
-            val = re.sub(r"\s+#.*$", "", val)
+            val = re.sub(r"\s+#(\s.*)?$", "", val)
         if val.strip() == "":
             # possible block list following
             items = []
@@ -197,7 +208,7 @@ def section_has_list_item(section_text: str) -> bool:
     if section_text is None:
         return False
     for line in section_text.splitlines():
-        m = re.match(r"^\s*(?:[-*]|\d+[.)])\s+(\S.*)$", line)
+        m = re.match(r"^\s*(?:[-*+]|\d+[.)])\s+(\S.*)$", line)
         if m and not SENTINEL_RE.search(m.group(1)):
             return True
     return False
@@ -248,8 +259,12 @@ def is_git_repo(repo: Path) -> bool:
         return False
 
 
-def capture_git_state(repo: Path) -> dict:
-    """Capture the REAL git state. No invention, no guessing."""
+def capture_git_state(repo: Path, exclude_prefix=None) -> dict:
+    """Capture the REAL git state. No invention, no guessing.
+
+    exclude_prefix: a repo-relative posix path (the handoff bundle itself) to leave out
+    of the drift fingerprint, so writing/committing the bundle is not seen as drift.
+    """
     branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
     commit = git(repo, "rev-parse", "HEAD").strip()
     try:
@@ -258,7 +273,7 @@ def capture_git_state(repo: Path) -> dict:
         subject = ""
     porcelain = git(repo, "status", "--porcelain=v1").rstrip("\n")
     diffstat = git(repo, "diff", "--stat", "HEAD").rstrip("\n")
-    fingerprint = compute_fingerprint(repo, commit)
+    fingerprint = compute_fingerprint(repo, commit, exclude_prefix=exclude_prefix)
     return {
         "branch": branch,
         "commit": commit,
@@ -280,33 +295,39 @@ def _hash_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def compute_fingerprint(repo: Path, commit: str) -> str:
-    """Deterministic, content-sensitive anchor for drift detection.
+def compute_fingerprint(repo: Path, commit: str, exclude_prefix=None) -> str:
+    """Content-sensitive anchor for drift detection.
 
     sha256 over HEAD + the *content* of every change vs HEAD: tracked changes (from
     `git diff --name-status HEAD`, hashing each working-tree file) and untracked files
-    (from `git ls-files --others`, hashing each). Uses name-status + content hashes
-    rather than raw diff text, so the result is independent of diff/color/context git
-    config — the same repo state yields the same fingerprint on any machine.
+    (from `git ls-files --others`, hashing each). It hashes content rather than raw
+    diff text, and runs the diff with rename detection OFF, so it does not depend on
+    git diff/color/context/rename config. (It can still differ across machines whose
+    ignore rules or end-of-line normalization differ — that only ever *over*-reports
+    drift, the safe direction; a resuming session re-verifies regardless.)
+
+    exclude_prefix: a repo-relative posix path to ignore (the handoff bundle itself).
     """
+    def excluded(p: str) -> bool:
+        return bool(exclude_prefix) and (p == exclude_prefix or p.startswith(exclude_prefix + "/"))
+
     tracked = []
-    for line in git(repo, "diff", "--name-status", "HEAD").splitlines():
+    # diff.renames=false: a rename is reported identically (delete + add) everywhere.
+    for line in git(repo, "-c", "diff.renames=false",
+                    "diff", "--name-status", "HEAD").splitlines():
         if not line.strip():
             continue
         parts = line.split("\t")
         status = parts[0]
-        if status[:1] in ("R", "C") and len(parts) >= 3:
-            old, new = parts[1], parts[2]
-            label, path_for_hash = f"{status}\t{old}\t{new}", new
-        else:
-            path_for_hash = parts[-1]
-            label = f"{status}\t{path_for_hash}"
+        path_for_hash = parts[-1]
+        if excluded(path_for_hash):
+            continue
         content = "DELETED" if status[:1] == "D" else _hash_file(repo / path_for_hash)
-        tracked.append(f"{label}\t{content}")
+        tracked.append(f"{status}\t{path_for_hash}\t{content}")
 
     untracked = []
     for path in git(repo, "ls-files", "--others", "--exclude-standard").splitlines():
-        if path.strip():
+        if path.strip() and not excluded(path):
             untracked.append(f"{_hash_file(repo / path)}\t{path}")
 
     payload = "\n".join(
@@ -338,7 +359,6 @@ def cmd_create(args) -> int:
         print(f"error: {repo} is not a git repository", file=sys.stderr)
         return 2
 
-    state = capture_git_state(repo)
     ts = now_iso()
     date = ts[:10]
     title = args.title or "Untitled session handoff"
@@ -348,6 +368,10 @@ def cmd_create(args) -> int:
         bundle = Path(args.out).resolve()
     else:
         bundle = (repo / "handoffs" / handoff_id).resolve()
+
+    # Exclude the bundle's own files from the drift fingerprint, so that creating (and
+    # later committing) the handoff is not itself reported as drift on `verify`.
+    state = capture_git_state(repo, exclude_prefix=_rel_to(bundle, repo))
 
     if bundle.exists() and any(bundle.iterdir()):
         print(f"error: bundle dir already exists and is not empty: {bundle}", file=sys.stderr)
@@ -621,7 +645,7 @@ def validate_bundle(bundle: Path) -> Findings:
         f.error(str(bundle), "bundle path is not a directory")
         return f
 
-    md_files = sorted(bundle.rglob("*.md"))
+    md_files = sorted(p for p in bundle.rglob("*.md") if p.is_file())
     if not md_files:
         f.error(str(bundle), "bundle contains no .md files")
         return f
@@ -632,14 +656,19 @@ def validate_bundle(bundle: Path) -> Findings:
     for path in md_files:
         rel = path.relative_to(bundle).as_posix()
         name = path.name
-        text = _read(path)
+        try:
+            text = _read(path)
+        except (UnicodeDecodeError, OSError) as e:
+            f.error(rel, f"cannot read as UTF-8 text ({type(e).__name__}); not a valid concept document")
+            continue
         fm, body, had_fm = parse_frontmatter(text)
         is_root = path.parent == bundle
 
         # --- sentinel check (handoff quality): nothing left unfilled --------
-        for i, line in enumerate(text.splitlines(), 1):
-            if SENTINEL_RE.search(line):
-                f.error(rel, f"unfilled <<FILL>> sentinel at line {i}")
+        # Scan the whole file (DOTALL) so a sentinel split across lines is caught too.
+        for mtch in SENTINEL_SCAN.finditer(text):
+            line_no = text.count("\n", 0, mtch.start()) + 1
+            f.error(rel, f"unfilled <<FILL>> sentinel at line {line_no}")
 
         # --- OKF conformance ----------------------------------------------
         if name == "index.md":
@@ -693,7 +722,10 @@ def _check_links(bundle, md_files, all_paths, f: Findings):
     link_re = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
     for path in md_files:
         rel = path.relative_to(bundle).as_posix()
-        text = _read(path)
+        try:
+            text = _read(path)
+        except (UnicodeDecodeError, OSError):
+            continue  # already reported by the main pass
         for m in link_re.finditer(text):
             target = m.group(1).strip()
             if not target or target.startswith("#"):
@@ -784,14 +816,27 @@ def _check_verification(items, f: Findings):
                         f"tests_status '{ts}' — never invent test results",
                     )
                 if body_status != "NOT RUN":
-                    # a claimed result must show evidence (a command and/or counts)
-                    has_cmd = "```" in results or re.search(r"(?m)^\s*\$\s+\S", results)
-                    has_counts = re.search(r"\d+\s+(passed|failed|error|ok|skipped)", results, re.I)
-                    if not (has_cmd or has_counts):
+                    # A claimed result must show real evidence: either pasted output
+                    # (a NON-EMPTY fenced code block) or an explicit command-prompt
+                    # line together with result counts. A prose claim or an empty
+                    # ``` ``` fence is NOT evidence.
+                    fences = re.findall(r"```[^\n]*\n(.*?)```", results, re.S)
+                    has_real_fence = any(
+                        any(ln.strip() for ln in blk.splitlines()) for blk in fences
+                    )
+                    has_cmd_line = re.search(r"(?m)^\s*\$\s+\S", results)
+                    has_counts = re.search(
+                        r"(?mi)\b\d+\s+(passed|failed|errors?|skipped|tests?)\b"
+                        r"|\bran\s+\d+\b|test result:",
+                        results,
+                    )
+                    if not (has_real_fence or (has_cmd_line and has_counts)):
                         f.error(
                             rel,
-                            f"Test Results claims '{body_status}' but shows no command or "
-                            "result counts as evidence — never invent test results",
+                            f"Test Results claims '{body_status}' but shows no real "
+                            "evidence (paste the command output in a non-empty ``` block, "
+                            "or give a `$ command` line plus result counts) — never invent "
+                            "test results",
                         )
 
         if not section_has_list_item(get_section(body, "Do Not Assume")):
@@ -833,10 +878,14 @@ def cmd_validate(args) -> int:
 def cmd_verify(args) -> int:
     bundle = Path(args.bundle).resolve()
     gs_path = bundle / "git-state.md"
-    if not gs_path.exists():
+    if not gs_path.is_file():
         print(f"error: no git-state.md in bundle: {bundle}", file=sys.stderr)
         return 2
-    fm, _body, _ = parse_frontmatter(_read(gs_path))
+    try:
+        fm, _body, _ = parse_frontmatter(_read(gs_path))
+    except (UnicodeDecodeError, OSError) as e:
+        print(f"error: cannot read git-state.md ({type(e).__name__})", file=sys.stderr)
+        return 2
     rec_commit = str(fm.get("commit", "")).strip()
     rec_branch = str(fm.get("branch", "")).strip()
     rec_fp = str(fm.get("status_fingerprint", "")).strip()
@@ -849,7 +898,9 @@ def cmd_verify(args) -> int:
         print(f"error: {repo} is not a git repository", file=sys.stderr)
         return 2
 
-    live = capture_git_state(repo)
+    # Use the same bundle exclusion as `create`, so the bundle's own files (and the
+    # commit that adds them) are not mistaken for drift in the underlying work.
+    live = capture_git_state(repo, exclude_prefix=_rel_to(bundle, repo))
     drift = []
     if rec_branch and live["branch"] != rec_branch:
         drift.append(f"branch: handoff='{rec_branch}' now='{live['branch']}'")

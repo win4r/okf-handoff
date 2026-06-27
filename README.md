@@ -101,13 +101,21 @@ No network, no LLM, no paid service. Exit 0 = all checks pass.
 
 ## Limitations
 
-- Drift detection is based on `HEAD` + working-tree status; it flags *that* the repo
-  moved, not a semantic 3-way merge of the work.
+- Drift detection compares `HEAD` + a content hash of the working-tree changes (see
+  [SPEC.md](SPEC.md) §3); it flags *that* the repo moved, not a semantic 3-way merge.
+  Two blind spots: a file-mode (`chmod`) change to an already-modified file, and
+  index-only staging churn, aren't in the fingerprint — the resume step's `git status`
+  + test re-run covers them. Across machines with different ignore rules or EOL
+  normalization it may *over*-report drift (the safe direction).
+- The validator enforces that test results are backed by pasted output and are
+  internally consistent — it makes casual invention fail, but it cannot detect a
+  *deliberately* fabricated command transcript. That residual is why the resuming
+  session **re-runs the tests itself.**
 - The frontmatter parser supports the YAML subset this profile uses (scalars, inline
-  and block lists, quotes, comments) — not arbitrary YAML — by design, so the
-  validator behaves identically everywhere.
-- The script fills git facts; **you** fill judgment. Quality of decisions/next-actions
-  is only as good as what you write (the validator enforces presence and honesty about
+  and block lists, quotes, comments) — not arbitrary YAML — by design, so the validator
+  behaves identically everywhere. Values containing `#` should be quoted.
+- The script fills git facts; **you** fill judgment. Decision/next-action *quality* is
+  only as good as what you write (the validator enforces presence and honesty about
   tests, not depth).
 - A fresh session still has to *follow* the resume procedure; the skills/commands make
   that the default path but cannot force a model to re-verify.

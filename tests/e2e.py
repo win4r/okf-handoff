@@ -253,6 +253,90 @@ def test_shipped_fixture_validates():
     print(f"ok  {len(fixtures)} shipped fixture(s) validate")
 
 
+def test_in_repo_bundle_no_drift_but_real_change_flagged():
+    """Regression (review #6): with the documented in-repo layout, `verify` right after
+    `create` reports NO DRIFT (the bundle's own files are excluded), yet a real change to
+    the underlying work is still flagged."""
+    with tempfile.TemporaryDirectory() as d:
+        repo = make_repo(Path(d))
+        r = tool("create", "--repo", str(repo), "--title", "In repo")
+        assert r.returncode == 0, r.stderr
+        bundles = list((repo / "handoffs").glob("*"))
+        assert len(bundles) == 1, bundles
+        bundle = bundles[0]
+        v0 = tool("verify", str(bundle), "--repo", str(repo))
+        assert v0.returncode == 0, f"in-repo create should leave NO DRIFT:\n{v0.stdout}"
+        # exclusion must NOT hide a real change to the work itself
+        (repo / "app.py").write_text("print('hello')\nprint('different wip')\n")
+        v1 = tool("verify", str(bundle), "--repo", str(repo))
+        assert v1.returncode == 3, f"a real work change must still drift:\n{v1.stdout}"
+    print("ok  in-repo create -> no drift, but real change still flagged")
+
+
+def test_validator_rejects_empty_fence_evidence():
+    """Regression (review #1): a fabricated PASSED whose only 'evidence' is an empty
+    code fence (or prose) must be rejected."""
+    with tempfile.TemporaryDirectory() as d:
+        repo = make_repo(Path(d))
+        bundle = Path(d) / "b"
+        tool("create", "--repo", str(repo), "--out", str(bundle), "--title", "Demo")
+        fill_bundle(bundle)
+        vf = bundle / "verification.md"
+        text = vf.read_text().replace("tests_status: not_run", "tests_status: passed")
+        text = text.replace("**Status: NOT RUN**", "**Status: PASSED**\n\n```\n```\n")
+        vf.write_text(text)
+        v = tool("validate", str(bundle))
+        assert v.returncode == 1, f"empty-fence PASSED must be rejected:\n{v.stdout}"
+        assert "never invent" in v.stdout.lower()
+    print("ok  validator rejects empty-fence 'evidence'")
+
+
+def test_validator_catches_multiline_sentinel():
+    """Regression (review #2): a <<FILL>> sentinel split across lines must be caught."""
+    with tempfile.TemporaryDirectory() as d:
+        repo = make_repo(Path(d))
+        bundle = Path(d) / "b"
+        tool("create", "--repo", str(repo), "--out", str(bundle), "--title", "Demo")
+        fill_bundle(bundle)
+        p = bundle / "progress.md"
+        p.write_text(p.read_text() + "\n<<FILL: still need\nto finish this>>\n")
+        v = tool("validate", str(bundle))
+        assert v.returncode == 1, "multi-line sentinel must fail validation"
+        assert "sentinel" in v.stdout.lower()
+    print("ok  validator catches multi-line sentinels")
+
+
+def test_validator_accepts_plus_bullets():
+    """Regression (review #3): '+' is a valid CommonMark bullet and must be accepted."""
+    with tempfile.TemporaryDirectory() as d:
+        repo = make_repo(Path(d))
+        bundle = Path(d) / "b"
+        tool("create", "--repo", str(repo), "--out", str(bundle), "--title", "Demo")
+        fill_bundle(bundle)
+        p = bundle / "progress.md"
+        p.write_text(p.read_text().replace(
+            "Decide whether to keep the WIP line, then commit.",
+            "+ Decide whether to keep the WIP line, then commit."))
+        v = tool("validate", str(bundle))
+        assert v.returncode == 0, f"'+' bullets must be accepted:\n{v.stdout}"
+    print("ok  validator accepts '+' bullets")
+
+
+def test_validate_survives_non_utf8_md():
+    """Regression (review #8): a non-UTF-8 .md must produce a clean error, not a crash."""
+    with tempfile.TemporaryDirectory() as d:
+        repo = make_repo(Path(d))
+        bundle = Path(d) / "b"
+        tool("create", "--repo", str(repo), "--out", str(bundle), "--title", "Demo")
+        fill_bundle(bundle)
+        (bundle / "blob.md").write_bytes(b"\xff\xfe\x00\x01 not utf8 \x80")
+        v = tool("validate", str(bundle))
+        assert "Traceback" not in (v.stdout + v.stderr), f"must not crash:\n{v.stderr}"
+        assert v.returncode == 1
+        assert "utf-8" in v.stdout.lower()
+    print("ok  validate survives a non-UTF-8 .md without crashing")
+
+
 def test_create_refuses_non_git_dir():
     with tempfile.TemporaryDirectory() as d:
         plain = Path(d) / "plain"
@@ -272,6 +356,11 @@ ALL_TESTS = [
     test_validator_rejects_empty_do_not_assume,
     test_verify_no_drift_then_drift,
     test_verify_detects_worktree_change_only,
+    test_in_repo_bundle_no_drift_but_real_change_flagged,
+    test_validator_rejects_empty_fence_evidence,
+    test_validator_catches_multiline_sentinel,
+    test_validator_accepts_plus_bullets,
+    test_validate_survives_non_utf8_md,
     test_shipped_fixture_validates,
     test_create_refuses_non_git_dir,
 ]
