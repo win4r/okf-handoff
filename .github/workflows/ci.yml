@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.8', '3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run deterministic E2E suite
+        run: python3 tests/e2e.py
+      - name: Validate every shipped handoff bundle
+        run: |
+          shopt -s nullglob
+          for b in handoffs/*/; do
+            echo "== validating $b =="
+            python3 scripts/okf_handoff.py validate "$b"
+          done
+
+  install-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install into a temp config dir and exercise the vendored engine
+        run: |
+          set -euo pipefail
+          export CLAUDE_CONFIG_DIR="$RUNNER_TEMP/cc"
+          bash install.sh
+          ENGINE="$CLAUDE_CONFIG_DIR/okf-handoff/okf_handoff.py"
+          python3 "$ENGINE" --version
+          shopt -s nullglob
+          for b in handoffs/*/; do python3 "$ENGINE" validate "$b"; done
+          bash uninstall.sh

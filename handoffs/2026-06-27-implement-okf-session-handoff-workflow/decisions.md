@@ -22,7 +22,7 @@ tags: [handoff]
 ## Standalone repo, not the home directory
 
 * **Choice**: Build in a dedicated git repo (`~/okf-handoff`) instead of the cwd.
-* **Why**: The invocation cwd was `/Users/charlesqin` (the home dir — not a git repo,
+* **Why**: The invocation cwd was `~` (the home dir — not a git repo,
   full of unrelated work). The workflow needs a real git repo for its git-state
   features and E2E test, and must not pollute or overwrite unrelated user files.
 * **Alternatives considered**: `git init` the home dir — rejected as destructive and out

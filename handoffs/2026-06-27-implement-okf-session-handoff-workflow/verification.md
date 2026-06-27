@@ -56,10 +56,10 @@ review's empty-fence and multi-line-sentinel cases. Each has a regression test.
 
 # Do Not Assume
 
-* Do not assume these tests still pass — **re-run** `python tests/e2e.py` yourself.
+* Do not assume these tests still pass — **re-run** `python3 tests/e2e.py` yourself.
 * Do not assume the repo matches this snapshot — it was captured at commit `056e0ae`
   with the review fixes uncommitted. After those are committed, HEAD advances; run
-  `python scripts/okf_handoff.py verify <this-bundle>` — **DRIFT is expected here.**
+  `python3 scripts/okf_handoff.py verify <this-bundle>` — **DRIFT is expected here.**
 * Do not assume the validator stops *deliberate* test-result fabrication — it only
   blocks casual invention. That is why resume re-runs the tests.
 * Do not assume PyYAML is installed — the tool uses a stdlib-only frontmatter parser.

@@ -1,5 +1,10 @@
 # OKF Session Handoff for Claude Code
 
+[![ci](https://github.com/win4r/okf-handoff/actions/workflows/ci.yml/badge.svg)](https://github.com/win4r/okf-handoff/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![python: 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)
+![dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
+
 Hand off a long Claude Code session to a **fresh** one without losing context — and
 without trusting hidden chat history or stale summaries.
 
@@ -59,7 +64,7 @@ it. New Claude Code sessions auto-discover the skills and commands.
 or directly:
 
 ```
-python scripts/okf_handoff.py create --title "Add OAuth refresh-token rotation"
+python3 scripts/okf_handoff.py create --title "Add OAuth refresh-token rotation"
 ```
 
 This inspects **real git state** (`git rev-parse`, `git status`, `git diff`) and
@@ -69,7 +74,7 @@ commands run, **real** test results, known failures, open questions, next action
 "Do Not Assume" notes — then validate and commit:
 
 ```
-python scripts/okf_handoff.py validate handoffs/<id>      # must pass (exit 0)
+python3 scripts/okf_handoff.py validate handoffs/<id>      # must pass (exit 0)
 git add handoffs/<id> && git commit -m "handoff: ..."
 ```
 
@@ -86,17 +91,23 @@ The fresh session reads only `CLAUDE.md` + the handoff, then **verifies before
 building**:
 
 ```
-python scripts/okf_handoff.py verify handoffs/<id>   # exit 0 = match, 3 = drift
+python3 scripts/okf_handoff.py verify handoffs/<id>   # exit 0 = match, 3 = drift
 ```
 
 It re-checks `git status`/`git diff`, re-runs the tests, reconciles any discrepancy
 (the repo wins), and only then continues the **Next Actions**.
 
+> **Note on the shipped examples.** A committed bundle records an *ancestor* commit (it
+> cannot contain its own commit hash), so running `verify` on a shipped example reports
+> `DRIFT DETECTED` (exit 3) on a fresh clone — that is the feature working, not a
+> failure. The clean NO-DRIFT path (exit 0) is exercised by `python3 tests/e2e.py` and
+> by running `create` then `verify` on your own not-yet-committed bundle.
+
 ## Commands
 
 | Command | Exit codes | What it does |
 |---------|-----------|--------------|
-| `create --title T [--repo .] [--out DIR]` | 0 ok, 2 not a git repo / dir exists | Capture real git state, scaffold a bundle. |
+| `create [--title T] [--repo .] [--out DIR] [--id ID]` | 0 ok, 2 not a git repo / dir exists | Capture real git state, scaffold a bundle. |
 | `validate <bundle> [--json]` | 0 valid, 1 problems | OKF conformance + handoff quality (see [SPEC.md](SPEC.md) §5). |
 | `verify <bundle> [--repo .] [--json]` | 0 no drift, 3 drift, 2 error | Compare recorded git snapshot to the live repo. |
 
@@ -110,7 +121,7 @@ document. See [SPEC.md](SPEC.md).
 ## Test it
 
 ```
-python tests/e2e.py        # deterministic: builds throwaway git repos, asserts behavior
+python3 tests/e2e.py        # deterministic: builds throwaway git repos, asserts behavior
 ```
 
 No network, no LLM, no paid service. Exit 0 = all checks pass.
@@ -135,5 +146,9 @@ No network, no LLM, no paid service. Exit 0 = all checks pass.
   tests, not depth).
 - A fresh session still has to *follow* the resume procedure; the skills/commands make
   that the default path but cannot force a model to re-verify.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 [okf]: https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md

@@ -37,7 +37,7 @@ A fresh session should, in order:
 
 1. Read this manifest and [Verification](verification.md).
 2. Detect git drift:
-   `python scripts/okf_handoff.py verify <this-bundle>`
+   `python3 scripts/okf_handoff.py verify <this-bundle>`
 3. Re-run the tests yourself before trusting the recorded results.
 4. Reconcile any discrepancies, then follow [Next Actions](progress.md).
 

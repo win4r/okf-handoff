@@ -7,7 +7,7 @@ Create an OKF session handoff so a fresh session can resume this work safely.
 
 Follow the **handoff-create** skill exactly. In short:
 
-1. Run `python scripts/okf_handoff.py create --title "$ARGUMENTS"` (uses cwd if no
+1. Run `python3 scripts/okf_handoff.py create --title "$ARGUMENTS"` (uses cwd if no
    title is given — pick a sensible one) to capture REAL git state into a bundle under
    `handoffs/`.
 2. Fill every `<<FILL: ...>>` sentinel from what actually happened **this session** —
@@ -15,7 +15,7 @@ Follow the **handoff-create** skill exactly. In short:
    actions, and "Do Not Assume" notes.
 3. **Never invent test results.** Record real runs with their command and counts, or
    leave `tests_status: not_run` and say what to run.
-4. Run `python scripts/okf_handoff.py validate handoffs/<id>` and fix every ERROR.
+4. Run `python3 scripts/okf_handoff.py validate handoffs/<id>` and fix every ERROR.
 5. Commit the bundle.
 
 Report the bundle path and the validation result.

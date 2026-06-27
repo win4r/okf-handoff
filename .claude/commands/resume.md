@@ -9,7 +9,7 @@ Follow the **handoff-resume** skill exactly. In short:
 
 1. Pick the handoff bundle: `$ARGUMENTS` if given, otherwise the most recent under
    `handoffs/`. Read `manifest.md` then the rest of the bundle.
-2. Detect drift: `python scripts/okf_handoff.py verify <bundle>` (exit 3 = drift; that
+2. Detect drift: `python3 scripts/okf_handoff.py verify <bundle>` (exit 3 = drift; that
    is expected, not an error — read the differences).
 3. Re-establish ground truth yourself: `git status`, `git log --oneline -5`,
    `git diff HEAD`, and open the files the handoff claims it changed.

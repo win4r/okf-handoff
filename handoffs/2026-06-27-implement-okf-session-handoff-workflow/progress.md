@@ -30,10 +30,10 @@ tags: [handoff]
 
 # Next Actions
 
-1. Run `python tests/e2e.py` to confirm all checks still pass — do **not** trust the
+1. Run `python3 tests/e2e.py` to confirm all checks still pass — do **not** trust the
    recorded result; re-run it.
 2. Commit the review fixes + this bundle together, then re-run
-   `python scripts/okf_handoff.py verify <this-bundle>` (drift is expected once HEAD
+   `python3 scripts/okf_handoff.py verify <this-bundle>` (drift is expected once HEAD
    advances).
 3. Optionally validate with a real fresh session: `claude -p` reading only `CLAUDE.md`
    + this bundle, then resuming.

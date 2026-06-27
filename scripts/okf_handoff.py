@@ -38,10 +38,12 @@ from pathlib import Path
 # Profile constants                                                           #
 # --------------------------------------------------------------------------- #
 
-OKF_VERSION = "0.1"
+TOOL_VERSION = "0.1.0"                                # this tool's release version
+OKF_VERSION = "0.1"                                   # the OKF data-format version (distinct)
 SENTINEL_RE = re.compile(r"<<FILL:[^>]*>>")          # single-line, for per-item checks
 SENTINEL_SCAN = re.compile(r"<<FILL:.*?>>", re.S)    # whole-file, catches multi-line
 RESERVED_FILENAMES = {"index.md", "log.md"}
+MAX_DOC_BYTES = 4 * 1024 * 1024                       # cap a single bundle doc (real ones are <4 KB)
 
 # Concept types this profile defines. Required ones make a handoff usable at all.
 REQUIRED_TYPES = ["Handoff Manifest", "Git State", "Progress", "Verification"]
@@ -651,7 +653,20 @@ class Findings:
         self.warnings.append((where, msg))
 
 
+def _within(root: Path, p: Path) -> bool:
+    """True if p, fully resolved (final + intermediate symlinks), stays inside root."""
+    try:
+        p.resolve().relative_to(root)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
 def _read(path: Path) -> str:
+    # Size cap first: refuse to slurp a giant file (a malicious/symlinked bundle doc)
+    # into memory. stat() follows symlinks, so this also bounds symlink-to-large-file.
+    if path.stat().st_size > MAX_DOC_BYTES:
+        raise ValueError(f"file exceeds {MAX_DOC_BYTES} bytes; not a handoff document")
     return path.read_text(encoding="utf-8")
 
 
@@ -661,9 +676,21 @@ def validate_bundle(bundle: Path) -> Findings:
         f.error(str(bundle), "bundle path is not a directory")
         return f
 
-    md_files = sorted(p for p in bundle.rglob("*.md") if p.is_file())
+    # Refuse symlinked or bundle-escaping .md entries: an OKF bundle is plain files, and
+    # following a committed symlink out of the bundle would read arbitrary local files.
+    broot = bundle.resolve()
+    md_files = []
+    for p in sorted(bundle.rglob("*.md")):
+        if not p.is_file():
+            continue
+        if p.is_symlink() or not _within(broot, p):
+            f.error(p.relative_to(bundle).as_posix(),
+                    "entry is a symlink or escapes the bundle; refusing to read (OKF bundles are plain files)")
+            continue
+        md_files.append(p)
     if not md_files:
-        f.error(str(bundle), "bundle contains no .md files")
+        if not f.errors:
+            f.error(str(bundle), "bundle contains no .md files")
         return f
 
     concepts_by_type = {}
@@ -674,8 +701,8 @@ def validate_bundle(bundle: Path) -> Findings:
         name = path.name
         try:
             text = _read(path)
-        except (UnicodeDecodeError, OSError) as e:
-            f.error(rel, f"cannot read as UTF-8 text ({type(e).__name__}); not a valid concept document")
+        except (UnicodeDecodeError, OSError, ValueError) as e:
+            f.error(rel, f"cannot read as a UTF-8 handoff document ({type(e).__name__}): {e}")
             continue
         fm, body, had_fm = parse_frontmatter(text)
         is_root = path.parent == bundle
@@ -740,7 +767,7 @@ def _check_links(bundle, md_files, all_paths, f: Findings):
         rel = path.relative_to(bundle).as_posix()
         try:
             text = _read(path)
-        except (UnicodeDecodeError, OSError):
+        except (UnicodeDecodeError, OSError, ValueError):
             continue  # already reported by the main pass
         for m in link_re.finditer(text):
             target = m.group(1).strip()
@@ -894,12 +921,12 @@ def cmd_validate(args) -> int:
 def cmd_verify(args) -> int:
     bundle = Path(args.bundle).resolve()
     gs_path = bundle / "git-state.md"
-    if not gs_path.is_file():
-        print(f"error: no git-state.md in bundle: {bundle}", file=sys.stderr)
+    if not gs_path.is_file() or gs_path.is_symlink() or not _within(bundle, gs_path):
+        print(f"error: no valid git-state.md in bundle: {bundle}", file=sys.stderr)
         return 2
     try:
         fm, _body, _ = parse_frontmatter(_read(gs_path))
-    except (UnicodeDecodeError, OSError) as e:
+    except (UnicodeDecodeError, OSError, ValueError) as e:
         print(f"error: cannot read git-state.md ({type(e).__name__})", file=sys.stderr)
         return 2
     rec_commit = str(fm.get("commit", "")).strip()
@@ -960,6 +987,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="okf_handoff.py",
         description="Create, validate, and verify OKF-style Claude Code session handoffs.",
+    )
+    p.add_argument(
+        "--version", action="version",
+        version=f"okf_handoff {TOOL_VERSION} (OKF bundle format v{OKF_VERSION})",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 

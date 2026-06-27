@@ -57,7 +57,9 @@ def tool(*args):
 def make_repo(root: Path) -> Path:
     repo = root / "repo"
     repo.mkdir()
-    git(repo, "init", "-q", "-b", "main")
+    # `git init -q` + symbolic-ref works on every git (the `-b main` flag needs git>=2.28).
+    git(repo, "init", "-q")
+    git(repo, "symbolic-ref", "HEAD", "refs/heads/main")
     (repo / "app.py").write_text("print('hello')\n")
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "initial commit")
@@ -337,6 +339,54 @@ def test_validate_survives_non_utf8_md():
     print("ok  validate survives a non-UTF-8 .md without crashing")
 
 
+def test_validate_refuses_symlink_escape():
+    """Security (audit): a .md that symlinks outside the bundle must be REFUSED, and its
+    target content must NOT be read/echoed."""
+    with tempfile.TemporaryDirectory() as d:
+        repo = make_repo(Path(d))
+        bundle = Path(d) / "b"
+        tool("create", "--repo", str(repo), "--out", str(bundle), "--title", "Demo")
+        fill_bundle(bundle)
+        secret = Path(d) / "secret.txt"
+        secret.write_text("TOPSECRET marker [x](pointer.md)\n")
+        (bundle / "leak.md").symlink_to(secret)
+        v = tool("validate", str(bundle))
+        assert v.returncode == 1, "a symlinked .md must make validation fail"
+        assert "symlink" in v.stdout.lower(), v.stdout
+        assert "TOPSECRET" not in (v.stdout + v.stderr), "must not read/echo the symlink target"
+    print("ok  validate refuses a bundle-escaping symlink without reading it")
+
+
+def test_validate_refuses_oversize_doc():
+    """Security (audit): an oversized .md must be refused, not slurped into memory."""
+    with tempfile.TemporaryDirectory() as d:
+        repo = make_repo(Path(d))
+        bundle = Path(d) / "b"
+        tool("create", "--repo", str(repo), "--out", str(bundle), "--title", "Demo")
+        fill_bundle(bundle)
+        (bundle / "huge.md").write_text("a" * (5 * 1024 * 1024))
+        v = tool("validate", str(bundle))
+        assert v.returncode == 1
+        assert "exceeds" in v.stdout.lower() or "too large" in v.stdout.lower(), v.stdout
+        assert "Traceback" not in (v.stdout + v.stderr)
+    print("ok  validate refuses an oversized document")
+
+
+def test_verify_refuses_symlinked_git_state():
+    """Security (audit): verify must not follow a symlinked git-state.md out of the bundle."""
+    with tempfile.TemporaryDirectory() as d:
+        repo = make_repo(Path(d))
+        bundle = Path(d) / "b"
+        tool("create", "--repo", str(repo), "--out", str(bundle), "--title", "Demo")
+        outside = Path(d) / "outside-git-state.md"
+        outside.write_text("---\ntype: Git State\nbranch: x\ncommit: deadbeef\nstatus_fingerprint: abc\n---\n")
+        (bundle / "git-state.md").unlink()
+        (bundle / "git-state.md").symlink_to(outside)
+        v = tool("verify", str(bundle), "--repo", str(repo))
+        assert v.returncode == 2, f"symlinked git-state.md must be refused (exit 2):\n{v.stdout}\n{v.stderr}"
+    print("ok  verify refuses a symlinked git-state.md")
+
+
 def test_create_refuses_non_git_dir():
     with tempfile.TemporaryDirectory() as d:
         plain = Path(d) / "plain"
@@ -361,6 +411,9 @@ ALL_TESTS = [
     test_validator_catches_multiline_sentinel,
     test_validator_accepts_plus_bullets,
     test_validate_survives_non_utf8_md,
+    test_validate_refuses_symlink_escape,
+    test_validate_refuses_oversize_doc,
+    test_verify_refuses_symlinked_git_state,
     test_shipped_fixture_validates,
     test_create_refuses_non_git_dir,
 ]

@@ -15,7 +15,7 @@ golden rule: **record only what you can verify. Never invent test results.**
    (the bundle is created in *that* project's `handoffs/`), run:
 
    ```
-   python scripts/okf_handoff.py create --title "<short task title>"
+   python3 scripts/okf_handoff.py create --title "<short task title>"
    ```
 
    This inspects the live repo (`git rev-parse`, `git status`, `git diff`) and writes
@@ -48,7 +48,7 @@ golden rule: **record only what you can verify. Never invent test results.**
 5. **Validate until green.**
 
    ```
-   python scripts/okf_handoff.py validate handoffs/<id>
+   python3 scripts/okf_handoff.py validate handoffs/<id>
    ```
 
    Fix every `ERROR`. Warnings are advisory. The bundle is not done until validation

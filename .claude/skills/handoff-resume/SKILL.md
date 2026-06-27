@@ -21,7 +21,7 @@ continue. Treat the handoff as guidance, **not ground truth.**
 3. **Detect git drift — before doing anything else.**
 
    ```
-   python scripts/okf_handoff.py verify handoffs/<id>
+   python3 scripts/okf_handoff.py verify handoffs/<id>
    ```
 
    - Exit `0` (NO DRIFT): the working tree still matches the snapshot.

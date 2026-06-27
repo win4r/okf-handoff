@@ -62,6 +62,9 @@ UNTRACKED
 <sorted "sha256(content)\tpath" for each untracked file>
 ```
 
+For a **deleted** tracked file there is no working-tree content, so the third field is
+the literal token `DELETED` (e.g. `D\tpath\tDELETED`).
+
 Changes vs HEAD come from `git -c diff.renames=false diff --name-status HEAD` (rename
 detection is disabled so a rename hashes identically everywhere), and untracked files
 from `git ls-files --others --exclude-standard`. The handoff bundle's **own** files are

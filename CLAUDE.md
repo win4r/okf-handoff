@@ -9,7 +9,7 @@ fresh session instead of trusting stale summaries.
 - **Resume:** in a fresh session, `/resume` (or the `handoff-resume` skill). Verify
   git state and re-run tests *before* trusting the handoff. It is **guidance, not
   ground truth.**
-- **Validate:** `python scripts/okf_handoff.py validate handoffs/<id>` (must pass).
-- **Check drift:** `python scripts/okf_handoff.py verify handoffs/<id>`.
+- **Validate:** `python3 scripts/okf_handoff.py validate handoffs/<id>` (must pass).
+- **Check drift:** `python3 scripts/okf_handoff.py verify handoffs/<id>`.
 
 Details: [README.md](README.md) · format: OKF v0.1 profile in [SPEC.md](SPEC.md).

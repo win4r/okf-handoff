@@ -43,7 +43,7 @@ From `git diff --stat HEAD`:
 This snapshot was true at 2026-06-27T08:57:24Z. The repo may have moved on. Detect drift with:
 
 ```
-python scripts/okf_handoff.py verify <this-bundle>
+python3 scripts/okf_handoff.py verify <this-bundle>
 ```
 
 Do **not** assume these files are still in this state. See [Verification](verification.md).
