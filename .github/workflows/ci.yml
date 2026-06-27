@@ -22,7 +22,9 @@ jobs:
       - name: Validate every shipped handoff bundle
         run: |
           shopt -s nullglob
-          for b in handoffs/*/; do
+          bundles=(handoffs/*/)
+          if [ ${#bundles[@]} -eq 0 ]; then echo "no handoff bundles found to validate"; exit 1; fi
+          for b in "${bundles[@]}"; do
             echo "== validating $b =="
             python3 scripts/okf_handoff.py validate "$b"
           done
@@ -42,5 +44,7 @@ jobs:
           ENGINE="$CLAUDE_CONFIG_DIR/okf-handoff/okf_handoff.py"
           python3 "$ENGINE" --version
           shopt -s nullglob
-          for b in handoffs/*/; do python3 "$ENGINE" validate "$b"; done
+          bundles=(handoffs/*/)
+          [ ${#bundles[@]} -gt 0 ] || { echo "no handoff bundles found"; exit 1; }
+          for b in "${bundles[@]}"; do python3 "$ENGINE" validate "$b"; done
           bash uninstall.sh

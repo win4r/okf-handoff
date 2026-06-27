@@ -36,6 +36,8 @@ tests/e2e.py               # deterministic end-to-end test (no network, no LLM)
 SPEC.md                    # the OKF-Handoff profile of OKF v0.1
 CLAUDE.md                  # minimal instructions a fresh session reads
 install.sh / uninstall.sh  # install the skills + commands user-globally
+.github/workflows/ci.yml   # CI: runs the e2e suite + validates every shipped bundle
+LICENSE / CHANGELOG.md     # MIT license; release notes
 ```
 
 ## Install (optional)

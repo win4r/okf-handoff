@@ -28,3 +28,5 @@ distinct from the OKF **bundle-format** version (`OKF_VERSION`, currently 0.1).
 - All documentation uses `python3` (some hosts have no `python` on PATH).
 - `tests/e2e.py` no longer requires git ≥ 2.28.
 - Removed a developer home-path string from a shipped example bundle.
+
+[0.1.0]: https://github.com/win4r/okf-handoff/releases/tag/v0.1.0

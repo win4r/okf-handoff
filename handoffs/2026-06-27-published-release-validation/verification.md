@@ -25,7 +25,10 @@ $ claude -p "<resume prompt>" --permission-mode bypassPermissions --model sonnet
 
 **Status: PASSED**
 
-`python3 tests/e2e.py` at commit `9b0c0a8` — all 17 checks passed (exit 0):
+`python3 tests/e2e.py` — all 17 checks passed (exit 0). Verbatim output, re-run at the
+published HEAD with both shipped bundles present (the `shipped fixture(s)` line therefore
+reads `2`; at the recorded commit `9b0c0a8`, before this bundle was committed, it read `1`
+— the 17-check total is identical):
 
 ```
 ok  create -> fresh bundle is rejected until filled
@@ -43,7 +46,7 @@ ok  validate survives a non-UTF-8 .md without crashing
 ok  validate refuses a bundle-escaping symlink without reading it
 ok  validate refuses an oversized document
 ok  verify refuses a symlinked git-state.md
-ok  N shipped fixture(s) validate
+ok  2 shipped fixture(s) validate
 ok  create refuses a non-git directory
 
 all 17 checks passed
