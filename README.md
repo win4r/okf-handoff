@@ -30,7 +30,23 @@ handoffs/                  # your handoff bundles live here
 tests/e2e.py               # deterministic end-to-end test (no network, no LLM)
 SPEC.md                    # the OKF-Handoff profile of OKF v0.1
 CLAUDE.md                  # minimal instructions a fresh session reads
+install.sh / uninstall.sh  # install the skills + commands user-globally
 ```
+
+## Install (optional)
+
+Out of the box the skills and `/handoff` `/resume` commands work whenever you run Claude
+Code **inside this repo**. To make them available in **every** project, install them
+user-globally:
+
+```
+./install.sh        # copies skills + commands into ~/.claude and vendors the engine
+```
+
+This is self-contained — it vendors the (dependency-free) engine into
+`~/.claude/okf-handoff/`, so it keeps working even if you move or delete this repo.
+Honors `$CLAUDE_CONFIG_DIR`. Re-run after `git pull` to refresh; `./uninstall.sh` removes
+it. New Claude Code sessions auto-discover the skills and commands.
 
 ## Use it
 

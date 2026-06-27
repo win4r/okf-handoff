@@ -11,7 +11,8 @@ golden rule: **record only what you can verify. Never invent test results.**
 
 ## Procedure
 
-1. **Scaffold from real git state.** From the repo root, run:
+1. **Scaffold from real git state.** From the root of the project you are handing off
+   (the bundle is created in *that* project's `handoffs/`), run:
 
    ```
    python scripts/okf_handoff.py create --title "<short task title>"
