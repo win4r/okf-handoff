@@ -64,4 +64,6 @@ review's empty-fence and multi-line-sentinel cases. Each has a regression test.
   blocks casual invention. That is why resume re-runs the tests.
 * Do not assume PyYAML is installed — the tool uses a stdlib-only frontmatter parser.
   Check `scripts/okf_handoff.py` has no third-party imports.
-* Do not assume `claude -p` live-resume was run — it was not (see [Open Questions](open-questions.md)).
+* Do not assume `claude -p` live-resume was run **as of this snapshot** — it was not.
+  (It was performed later, at HEAD `9b0c0a8`; the exact command + transcript are recorded
+  in the [published-release validation handoff](../2026-06-27-published-release-validation/verification.md).)
