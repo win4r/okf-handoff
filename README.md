@@ -1,5 +1,3 @@
-# [🚀观看我的哔哩哔哩视频](https://space.bilibili.com/3493277319825652)
-
 # OKF Session Handoff for Claude Code
 
 [![ci](https://github.com/win4r/okf-handoff/actions/workflows/ci.yml/badge.svg)](https://github.com/win4r/okf-handoff/actions/workflows/ci.yml)
